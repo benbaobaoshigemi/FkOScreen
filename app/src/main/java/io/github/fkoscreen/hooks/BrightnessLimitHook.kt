@@ -153,23 +153,28 @@ object BrightnessLimitHook {
             XposedBridge.log("$TAG: Failed to hook OplusDisplayBrightnessModel: ${t.message}")
         }
 
-        // 5. 拦截 OplusFeatureEdrEnhanceBrightness 动态捕获 HBM 阈值
-        try {
-            val edrClass = XposedHelpers.findClass(
-                "com.android.server.display.feature.postprocess.OplusFeatureEdrEnhanceBrightness",
-                classLoader
-            )
-            XposedBridge.hookAllMethods(edrClass, "getEdrNormalLimit", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val edrNit = (param.result as? Number)?.toFloat() ?: 0f
-                    if (edrNit > 0f) {
-                        updateHbmNit(edrNit)
-                    }
+        // 5. 拦截 getEdrNormalLimit 动态捕获 HBM 阈值（ColorOS 17 起该方法分散在多个类中）
+        val edrHookCallback = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val edrNit = (param.result as? Number)?.toFloat() ?: 0f
+                if (edrNit > 0f) {
+                    updateHbmNit(edrNit)
                 }
-            })
-            XposedBridge.log("$TAG: Hooked OplusFeatureEdrEnhanceBrightness.getEdrNormalLimit")
-        } catch (t: Throwable) {
-            XposedBridge.log("$TAG: Failed to hook OplusFeatureEdrEnhanceBrightness: ${t.message}")
+            }
+        }
+        listOf(
+            "com.android.server.display.config.global.OplusDisplayGlobalConfig",
+            "com.android.server.display.feature.postprocess.OplusFeaturePwEdrEnhanceBrightness",
+            "com.android.server.display.feature.postprocess.OplusFeatureEdrEnhanceBrightness"
+        ).forEach { cName ->
+            // 逐个隔离：任一类缺失都不能中断后续 hook（本方法在 system_server 入口中最先执行）
+            try {
+                val clazz = XposedHelpers.findClass(cName, classLoader)
+                XposedBridge.hookAllMethods(clazz, "getEdrNormalLimit", edrHookCallback)
+                XposedBridge.log("$TAG: Hooked $cName.getEdrNormalLimit")
+            } catch (t: Throwable) {
+                XposedBridge.log("$TAG: Failed to hook $cName.getEdrNormalLimit: ${t.message}")
+            }
         }
 
         // 6. 拦截 OplusFeatureTemperatureLimitBrightness（解除温度对亮度限制）
@@ -252,21 +257,26 @@ object BrightnessLimitHook {
     }
 
     fun initSystemUI(classLoader: ClassLoader) {
-        // 7. 拦截 SystemUI BrightnessController，拓宽滑块组件上限
-        try {
-            val bcClass = XposedHelpers.findClass(
-                "com.android.systemui.settings.brightness.BrightnessController",
-                classLoader
-            )
-            XposedBridge.hookAllConstructors(bcClass, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val target = getTargetBrightness() ?: return
-                    try {
-                        XposedHelpers.setFloatField(param.thisObject, "mBrightnessMax", target)
-                    } catch (_: Throwable) {}
-                }
-            })
-            XposedBridge.log("$TAG: Hooked SystemUI BrightnessController")
-        } catch (_: Throwable) {}
+        // 7. 拦截 SystemUI BrightnessController（新旧两套 QS 实现），拓宽滑块组件上限
+        val hookCallback = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val target = getTargetBrightness() ?: return
+                try {
+                    XposedHelpers.setFloatField(param.thisObject, "mBrightnessMax", target)
+                } catch (_: Throwable) {}
+            }
+        }
+        listOf(
+            "com.android.systemui.qs.deprecated.brightness.BrightnessController",
+            "com.android.systemui.settings.brightness.BrightnessController"
+        ).forEach { name ->
+            try {
+                val bcClass = XposedHelpers.findClass(name, classLoader)
+                XposedBridge.hookAllConstructors(bcClass, hookCallback)
+                XposedBridge.log("$TAG: Hooked SystemUI $name")
+            } catch (t: Throwable) {
+                XposedBridge.log("$TAG: Failed to hook SystemUI $name: ${t.message}")
+            }
+        }
     }
 }

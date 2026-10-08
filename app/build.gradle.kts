@@ -9,7 +9,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "io.github.benbaobaoshigemi.fkoscreen"
+        applicationId = "io.github.fkoscreen"
         minSdk = 26
         targetSdk = 34
         versionCode = 1

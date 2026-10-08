@@ -2,11 +2,10 @@ package io.github.fkoscreen.util
 
 import android.content.Context
 import android.provider.Settings
-import java.math.BigDecimal
 import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.hypot
-import kotlin.math.roundToInt
-import kotlin.math.sqrt
+import kotlin.math.sin
 
 data class ColorBallState(
     val cct: Float,       // [-1.0f, 1.0f]: -1.0 为极暖(暖橙), +1.0 为极冷(浅蓝), 0.0 为标准白点
@@ -16,13 +15,22 @@ data class ColorBallState(
     val r: Int,           // 红色通道增益 (900~1000)
     val g: Int,           // 绿色通道增益 (900~1000)
     val b: Int,           // 蓝色通道增益 (900~1000)
-    val rgbStr: String    // ColorOS 格式字符串，如 "1000,980,928,1,1"
+    val rgbStr: String    // ColorOS 格式字符串，如 "1000,989,962,1,1"
 )
 
 object ColorBallCalculator {
     const val CENTER_750 = 375.0f
     const val RADIUS_750 = 315.0f
-    private val SQRT_2 = sqrt(2.0f)
+
+    // 物理特征参考角度（基于 ColorOS 6 扇区色轮与原厂实测标定点，单位：度）
+    // 冷色预设点 (432.956, 562.888) -> theta = +72.857143°
+    // 品红特征顶点 (R=max, G=min, B=max) -> theta = -30.0°
+    // 暖色预设点 (230.582, 221.926) -> theta = -133.333333°
+    // 青绿特征顶点 (R=min, G=max, B=min) -> theta = +150.0°
+    const val THETA_COLD = 72.857143
+    const val THETA_MAGENTA = -30.0
+    const val THETA_WARM = -133.333333
+    const val THETA_GREEN = 150.0
 
     private const val KEY_POINT_X = "color_ball_last_pointx"
     private const val KEY_POINT_Y = "color_ball_last_pointy"
@@ -57,7 +65,104 @@ object ColorBallCalculator {
     }
 
     /**
-     * 官方 ColorOS 原厂 6 扇区算法复刻 (来自 ScreenColorTemperateBall.java)
+     * ColorOS 17 内外圈非线性手感映射函数
+     */
+    fun mapPointPercentInnerOuter(d: Double): Double {
+        val c = d.coerceIn(0.0, 1.0)
+        return if (c <= 0.55) {
+            (c / 0.55) * 0.15
+        } else {
+            0.15 + ((c - 0.55) / 0.45) * 0.85
+        }
+    }
+
+    /**
+     * ColorOS 17 内外圈非线性手感逆映射函数
+     */
+    fun invertPointPercentInnerOuter(d: Double): Double {
+        val c = d.coerceIn(0.0, 1.0)
+        return if (c <= 0.15) {
+            (c / 0.15) * 0.55
+        } else {
+            0.55 + ((c - 0.15) / 0.85) * 0.45
+        }
+    }
+
+    /**
+     * 将参数空间极角 phi [-180, 180] 映射到物理圆盘角度 theta [-180, 180]
+     * 0° (冷色) -> +72.857°
+     * 90° (品红) -> -30.0°
+     * 180° (暖色) -> -133.333°
+     * 270°/-90° (青绿) -> +150.0°
+     */
+    fun phiToTheta(phiDeg: Double): Double {
+        var p = phiDeg % 360.0
+        if (p < 0.0) p += 360.0
+
+        val theta = when {
+            p < 90.0 -> {
+                val frac = p / 90.0
+                THETA_COLD - frac * (THETA_COLD - THETA_MAGENTA)
+            }
+            p <= 180.0 -> {
+                val frac = (p - 90.0) / 90.0
+                THETA_MAGENTA - frac * (Math.abs(THETA_WARM) - Math.abs(THETA_MAGENTA))
+            }
+            p <= 270.0 -> {
+                val frac = (p - 180.0) / 90.0
+                val tWarmNorm = 360.0 + THETA_WARM
+                var t = tWarmNorm - frac * (tWarmNorm - THETA_GREEN)
+                if (t > 180.0) t -= 360.0
+                t
+            }
+            else -> {
+                val frac = (p - 270.0) / 90.0
+                THETA_GREEN - frac * (THETA_GREEN - THETA_COLD)
+            }
+        }
+
+        var tNorm = theta
+        while (tNorm <= -180.0) tNorm += 360.0
+        while (tNorm > 180.0) tNorm -= 360.0
+        return tNorm
+    }
+
+    /**
+     * 将物理圆盘角度 theta [-180, 180] 逆映射回参数空间极角 phi [-180, 180]
+     */
+    fun thetaToPhi(thetaDeg: Double): Double {
+        var t = thetaDeg
+        while (t <= -180.0) t += 360.0
+        while (t > 180.0) t -= 360.0
+
+        var phi = when {
+            t <= THETA_COLD && t >= THETA_MAGENTA -> {
+                val frac = (THETA_COLD - t) / (THETA_COLD - THETA_MAGENTA)
+                frac * 90.0
+            }
+            t < THETA_MAGENTA && t >= THETA_WARM -> {
+                val frac = (THETA_MAGENTA - t) / (THETA_MAGENTA - THETA_WARM)
+                90.0 + frac * 90.0
+            }
+            t >= THETA_GREEN || t < THETA_WARM -> {
+                val tNorm = if (t < 0.0) t + 360.0 else t
+                val tWarmNorm = 360.0 + THETA_WARM
+                val frac = (tWarmNorm - tNorm) / (tWarmNorm - THETA_GREEN)
+                180.0 + frac * 90.0
+            }
+            else -> {
+                val frac = (THETA_GREEN - t) / (THETA_GREEN - THETA_COLD)
+                270.0 + frac * 90.0
+            }
+        }
+
+        while (phi > 180.0) phi -= 360.0
+        while (phi <= -180.0) phi += 360.0
+        return phi
+    }
+
+    /**
+     * 官方 ColorOS 17 原厂 6 扇区 RGB 计算法 (来自 ScreenColorTemperateBall.java)
      */
     fun calculateRange(angle: Float, dx: Float, dy: Float, radius: Float): String {
         val minVal = getSystemRgbMin()
@@ -65,102 +170,72 @@ object ColorBallCalculator {
         val rangeDis = maxVal - minVal
 
         val dist = hypot(dx.toDouble(), dy.toDouble())
-        val pointPercent = (dist / radius.toDouble()).coerceIn(0.0, 1.0)
+        val rawPercent = (dist / radius.toDouble()).coerceIn(0.0, 1.0)
+        val pointPercent = mapPointPercentInnerOuter(rawPercent)
 
-        // 弧度转角度 (-180.0 ~ 180.0)
-        val deg = (180.0 * angle.toDouble()) / Math.PI
+        val deg = Math.toDegrees(angle.toDouble())
         val dAbs = Math.abs(deg)
-        val bd = BigDecimal(deg)
 
-        var rVal: Int
-        var gVal: Int
-        var bVal: Int
+        val rVal: Int
+        val gVal: Int
+        val bVal: Int
 
-        if (bd.compareTo(BigDecimal(-90.0)) <= 0 || bd.compareTo(BigDecimal(-30.0)) > 0) {
-            if (bd.compareTo(BigDecimal(-150.0)) <= 0 || bd.compareTo(BigDecimal(-90.0)) > 0) {
-                if (bd.compareTo(BigDecimal(-180.0)) > 0 && bd.compareTo(BigDecimal(-150.0)) <= 0) {
-                    val d4 = maxVal.toDouble()
-                    val d5 = rangeDis.toDouble()
-                    val i6 = (d4 - ((d4 - (d4 - (((dAbs - 150.0) / 60.0) * d5))) * pointPercent)).toInt()
-                    val i7 = (d4 - (d5 * pointPercent)).toInt()
-                    rVal = i6
-                    gVal = i6
-                    bVal = i7
-                } else if (bd.compareTo(BigDecimal(150.0)) > 0 && bd.compareTo(BigDecimal(180.0)) <= 0) {
-                    val d6 = rangeDis.toDouble()
-                    val d7 = minVal.toDouble() + (((dAbs - 150.0) / 60.0) * d6)
-                    val d8 = maxVal.toDouble()
-                    val i6 = (d8 - ((d8 - d7) * pointPercent)).toInt()
-                    val i7 = (d8 - (d6 * pointPercent)).toInt()
-                    rVal = i6
-                    gVal = i6
-                    bVal = i7
-                } else if (bd.compareTo(BigDecimal(90.0)) <= 0 || bd.compareTo(BigDecimal(150.0)) > 0) {
-                    val d2: Double
-                    val i4: Int
-                    if (bd.compareTo(BigDecimal(30.0)) > 0 && bd.compareTo(BigDecimal(90.0)) <= 0) {
-                        val d9 = rangeDis.toDouble()
-                        val d10 = minVal.toDouble() + (((dAbs - 30.0) / 60.0) * d9)
-                        val d11 = maxVal.toDouble()
-                        i4 = (d11 - (d9 * pointPercent)).toInt()
-                        d2 = d11 - ((d11 - d10) * pointPercent)
-                    } else if (bd.compareTo(BigDecimal(0.0)) > 0 && bd.compareTo(BigDecimal(30.0)) <= 0) {
-                        val d12 = (30.0 - dAbs) / 60.0
-                        val d13 = rangeDis.toDouble()
-                        val d14 = maxVal.toDouble()
-                        i4 = (d14 - ((d14 - (minVal.toDouble() + (d12 * d13))) * pointPercent)).toInt()
-                        d2 = (d14 - (d13 * pointPercent))
-                    } else if (bd.compareTo(BigDecimal(-30.0)) <= 0 || bd.compareTo(BigDecimal(0.0)) > 0) {
-                        i4 = maxVal
-                        d2 = maxVal.toDouble()
-                    } else {
-                        val d15 = rangeDis.toDouble()
-                        val d16 = minVal.toDouble() + (((dAbs + 30.0) / 60.0) * d15)
-                        val d17 = maxVal.toDouble()
-                        i4 = (d17 - ((d17 - d16) * pointPercent)).toInt()
-                        d2 = d17 - (d15 * pointPercent)
-                    }
-                    rVal = i4
-                    gVal = d2.toInt()
-                    bVal = maxVal
-                } else {
-                    val d18 = (150.0 - dAbs) / 60.0
-                    val d19 = rangeDis.toDouble()
-                    val d20 = minVal.toDouble() + (d18 * d19)
-                    val d21 = maxVal.toDouble()
-                    val i6 = (d21 - (d19 * pointPercent)).toInt()
-                    val i7 = (d21 - ((d21 - d20) * pointPercent)).toInt()
-                    rVal = i6
-                    gVal = i6
-                    bVal = i7
-                }
-            } else {
-                val d22 = rangeDis.toDouble()
-                val d23 = minVal.toDouble() + (((dAbs - 90.0) / 60.0) * d22)
-                val d24 = maxVal.toDouble()
-                val i8 = (d24 - ((d24 - d23) * pointPercent)).toInt()
-                val i9 = (d24 - (d22 * pointPercent)).toInt()
+        when {
+            deg >= -90.0 && deg <= -30.0 -> {
+                val bInterp = minVal + ((90.0 - dAbs) / 60.0) * rangeDis
                 rVal = maxVal
-                gVal = i8
-                bVal = i9
+                gVal = (maxVal - (rangeDis * pointPercent)).toInt()
+                bVal = (maxVal - ((maxVal - bInterp) * pointPercent)).toInt()
             }
-        } else {
-            val d25 = (90.0 - dAbs) / 60.0
-            val d26 = rangeDis.toDouble()
-            val d27 = minVal.toDouble() + (d25 * d26)
-            val d28 = maxVal.toDouble()
-            val i8 = (d28 - (d26 * pointPercent)).toInt()
-            val i9 = (d28 - ((d28 - d27) * pointPercent)).toInt()
-            rVal = maxVal
-            gVal = i8
-            bVal = i9
+            deg < -90.0 && deg >= -150.0 -> {
+                val gInterp = minVal + ((dAbs - 90.0) / 60.0) * rangeDis
+                rVal = maxVal
+                gVal = (maxVal - ((maxVal - gInterp) * pointPercent)).toInt()
+                bVal = (maxVal - (rangeDis * pointPercent)).toInt()
+            }
+            deg < -150.0 && deg >= -180.0 -> {
+                val rInterp = minVal + ((180.0 - dAbs) / 60.0) * rangeDis
+                rVal = (maxVal - ((maxVal - rInterp) * pointPercent)).toInt()
+                gVal = maxVal
+                bVal = (maxVal - (rangeDis * pointPercent)).toInt()
+            }
+            deg > 150.0 && deg <= 180.0 -> {
+                val rInterp = minVal + ((dAbs - 150.0) / 60.0) * rangeDis
+                rVal = (maxVal - ((maxVal - rInterp) * pointPercent)).toInt()
+                gVal = maxVal
+                bVal = (maxVal - (rangeDis * pointPercent)).toInt()
+            }
+            deg > 90.0 && deg <= 150.0 -> {
+                val bInterp = minVal + ((150.0 - dAbs) / 60.0) * rangeDis
+                rVal = (maxVal - (rangeDis * pointPercent)).toInt()
+                gVal = maxVal
+                bVal = (maxVal - ((maxVal - bInterp) * pointPercent)).toInt()
+            }
+            deg > 30.0 && deg <= 90.0 -> {
+                val gInterp = minVal + ((dAbs - 30.0) / 60.0) * rangeDis
+                rVal = (maxVal - (rangeDis * pointPercent)).toInt()
+                gVal = (maxVal - ((maxVal - gInterp) * pointPercent)).toInt()
+                bVal = maxVal
+            }
+            deg >= 0.0 && deg <= 30.0 -> {
+                val rInterp = minVal + ((30.0 - dAbs) / 60.0) * rangeDis
+                rVal = (maxVal - ((maxVal - rInterp) * pointPercent)).toInt()
+                gVal = (maxVal - (rangeDis * pointPercent)).toInt()
+                bVal = maxVal
+            }
+            else -> {
+                val rInterp = minVal + ((dAbs + 30.0) / 60.0) * rangeDis
+                rVal = (maxVal - ((maxVal - rInterp) * pointPercent)).toInt()
+                gVal = (maxVal - (rangeDis * pointPercent)).toInt()
+                bVal = maxVal
+            }
         }
 
-        rVal = rVal.coerceIn(minVal, maxVal)
-        gVal = gVal.coerceIn(minVal, maxVal)
-        bVal = bVal.coerceIn(minVal, maxVal)
+        val rClamped = rVal.coerceIn(minVal, maxVal)
+        val gClamped = gVal.coerceIn(minVal, maxVal)
+        val bClamped = bVal.coerceIn(minVal, maxVal)
 
-        return "$rVal,$gVal,$bVal,1,1"
+        return "$rClamped,$gClamped,$bClamped,1,1"
     }
 
     /**
@@ -170,31 +245,45 @@ object ColorBallCalculator {
         var c = cct.coerceIn(-1.0f, 1.0f)
         var t = tint.coerceIn(-1.0f, 1.0f)
 
-        // 若矢量模长超过圆盘半径，进行径向归一化限位
-        val mag = hypot(c.toDouble(), t.toDouble()).toFloat()
-        if (mag > 1.0f) {
-            c /= mag
-            t /= mag
+        var rNorm = hypot(c.toDouble(), t.toDouble())
+        if (rNorm > 1.0) {
+            c = (c / rNorm).toFloat()
+            t = (t / rNorm).toFloat()
+            rNorm = 1.0
         }
 
-        val dx = ((c + t) / SQRT_2) * RADIUS_750
-        val dy = ((c - t) / SQRT_2) * RADIUS_750
+        val maxV = getSystemRgbMax()
+        if (rNorm < 1e-4) {
+            return ColorBallState(
+                cct = 0.0f,
+                tint = 0.0f,
+                x750 = CENTER_750,
+                y750 = CENTER_750,
+                r = maxV,
+                g = maxV,
+                b = maxV,
+                rgbStr = "$maxV,$maxV,$maxV,1,1"
+            )
+        }
+
+        val phiRad = atan2(t.toDouble(), c.toDouble())
+        val phiDeg = Math.toDegrees(phiRad)
+        val thetaDeg = phiToTheta(phiDeg)
+        val thetaRad = Math.toRadians(thetaDeg)
+
+        val dx = (rNorm * RADIUS_750 * cos(thetaRad)).toFloat()
+        val dy = (rNorm * RADIUS_750 * sin(thetaRad)).toFloat()
 
         val x750 = CENTER_750 + dx
         val y750 = CENTER_750 + dy
 
-        val angle = atan2(dy, dx)
-        val rgbStr = if (hypot(dx.toDouble(), dy.toDouble()) < 0.5) {
-            val maxV = getSystemRgbMax()
-            "$maxV,$maxV,$maxV,1,1"
-        } else {
-            calculateRange(angle, dx, dy, RADIUS_750)
-        }
+        val angle = atan2(dy.toDouble(), dx.toDouble()).toFloat()
+        val rgbStr = calculateRange(angle, dx, dy, RADIUS_750)
 
         val parts = rgbStr.split(",")
-        val r = parts.getOrNull(0)?.toIntOrNull() ?: 1000
-        val g = parts.getOrNull(1)?.toIntOrNull() ?: 1000
-        val b = parts.getOrNull(2)?.toIntOrNull() ?: 1000
+        val r = parts.getOrNull(0)?.toIntOrNull() ?: maxV
+        val g = parts.getOrNull(1)?.toIntOrNull() ?: maxV
+        val b = parts.getOrNull(2)?.toIntOrNull() ?: maxV
 
         return ColorBallState(
             cct = c,
@@ -214,22 +303,39 @@ object ColorBallCalculator {
     fun decompose(x750: Float, y750: Float): ColorBallState {
         val dx = x750 - CENTER_750
         val dy = y750 - CENTER_750
+        val dist = hypot(dx.toDouble(), dy.toDouble())
 
-        val cct = ((dx + dy) / (SQRT_2 * RADIUS_750)).coerceIn(-1.0f, 1.0f)
-        val tint = ((dx - dy) / (SQRT_2 * RADIUS_750)).coerceIn(-1.0f, 1.0f)
-
-        val angle = atan2(dy, dx)
-        val rgbStr = if (hypot(dx.toDouble(), dy.toDouble()) < 0.5) {
-            val maxV = getSystemRgbMax()
-            "$maxV,$maxV,$maxV,1,1"
-        } else {
-            calculateRange(angle, dx, dy, RADIUS_750)
+        val maxV = getSystemRgbMax()
+        if (dist < 0.5) {
+            return ColorBallState(
+                cct = 0.0f,
+                tint = 0.0f,
+                x750 = CENTER_750,
+                y750 = CENTER_750,
+                r = maxV,
+                g = maxV,
+                b = maxV,
+                rgbStr = "$maxV,$maxV,$maxV,1,1"
+            )
         }
 
+        val rNorm = (dist / RADIUS_750.toDouble()).coerceIn(0.0, 1.0)
+        val thetaRad = atan2(dy.toDouble(), dx.toDouble())
+        val thetaDeg = Math.toDegrees(thetaRad)
+
+        val phiDeg = thetaToPhi(thetaDeg)
+        val phiRad = Math.toRadians(phiDeg)
+
+        val cct = (rNorm * cos(phiRad)).toFloat().coerceIn(-1.0f, 1.0f)
+        val tint = (rNorm * sin(phiRad)).toFloat().coerceIn(-1.0f, 1.0f)
+
+        val angle = thetaRad.toFloat()
+        val rgbStr = calculateRange(angle, dx, dy, RADIUS_750)
+
         val parts = rgbStr.split(",")
-        val r = parts.getOrNull(0)?.toIntOrNull() ?: 1000
-        val g = parts.getOrNull(1)?.toIntOrNull() ?: 1000
-        val b = parts.getOrNull(2)?.toIntOrNull() ?: 1000
+        val r = parts.getOrNull(0)?.toIntOrNull() ?: maxV
+        val g = parts.getOrNull(1)?.toIntOrNull() ?: maxV
+        val b = parts.getOrNull(2)?.toIntOrNull() ?: maxV
 
         return ColorBallState(
             cct = cct,
@@ -248,6 +354,10 @@ object ColorBallCalculator {
      */
     fun readFromSystem(context: Context): ColorBallState {
         val cr = context.contentResolver
+        val mode = try {
+            Settings.System.getInt(cr, KEY_BALL_MODE, 2)
+        } catch (_: Throwable) { 2 }
+
         val x = try {
             Settings.System.getFloat(cr, KEY_POINT_X, -1.0f)
         } catch (_: Throwable) { -1.0f }
@@ -256,9 +366,17 @@ object ColorBallCalculator {
             Settings.System.getFloat(cr, KEY_POINT_Y, -1.0f)
         } catch (_: Throwable) { -1.0f }
 
-        if (x <= 0.0f || y <= 0.0f) {
+        if (mode == 2 || (x <= 0.0f && y <= 0.0f)) {
             // 处于默认白点中心
             return compose(0.0f, 0.0f)
+        }
+
+        if (mode == 1 && (x <= 0.0f || y <= 0.0f)) {
+            return decompose(230.582f, 221.926f)
+        }
+
+        if (mode == 3 && (x <= 0.0f || y <= 0.0f)) {
+            return decompose(432.956f, 562.888f)
         }
 
         return decompose(x, y)
@@ -275,14 +393,23 @@ object ColorBallCalculator {
      */
     fun applyToSystem(context: Context, state: ColorBallState) {
         val cr = context.contentResolver
+        val isCenter = Math.abs(state.cct) < 0.005f && Math.abs(state.tint) < 0.005f
+        val isWarmPreset = Math.abs(state.cct - (-0.6681f)) < 0.02f && Math.abs(state.tint) < 0.02f
+        val isColdPreset = Math.abs(state.cct - 0.6242f) < 0.02f && Math.abs(state.tint) < 0.02f
+
+        val ballMode = when {
+            isCenter -> 2
+            isWarmPreset -> 1
+            isColdPreset -> 3
+            else -> 4
+        }
+
         var directSuccess = false
         try {
             Settings.System.putString(cr, KEY_EYEPROTECT_RGB, state.rgbStr)
             Settings.System.putFloat(cr, KEY_POINT_X, state.x750)
             Settings.System.putFloat(cr, KEY_POINT_Y, state.y750)
-
-            val isCenter = Math.abs(state.cct) < 0.005f && Math.abs(state.tint) < 0.005f
-            Settings.System.putInt(cr, KEY_BALL_MODE, if (isCenter) 2 else 4)
+            Settings.System.putInt(cr, KEY_BALL_MODE, ballMode)
             directSuccess = true
         } catch (_: Throwable) {
             directSuccess = false
@@ -299,11 +426,19 @@ object ColorBallCalculator {
                             val targetState = pendingRootState ?: break
                             pendingRootState = null
                             try {
-                                val isCenter = Math.abs(targetState.cct) < 0.005f && Math.abs(targetState.tint) < 0.005f
+                                val isC = Math.abs(targetState.cct) < 0.005f && Math.abs(targetState.tint) < 0.005f
+                                val isW = Math.abs(targetState.cct - (-0.6681f)) < 0.02f && Math.abs(targetState.tint) < 0.02f
+                                val isK = Math.abs(targetState.cct - 0.6242f) < 0.02f && Math.abs(targetState.tint) < 0.02f
+                                val modeInt = when {
+                                    isC -> 2
+                                    isW -> 1
+                                    isK -> 3
+                                    else -> 4
+                                }
                                 val cmd = "settings put system $KEY_EYEPROTECT_RGB '${targetState.rgbStr}'; " +
                                         "settings put system $KEY_POINT_X ${targetState.x750}; " +
                                         "settings put system $KEY_POINT_Y ${targetState.y750}; " +
-                                        "settings put system $KEY_BALL_MODE ${if (isCenter) 2 else 4}"
+                                        "settings put system $KEY_BALL_MODE $modeInt"
                                 Runtime.getRuntime().exec(arrayOf("su", "-c", cmd)).waitFor()
                             } catch (_: Throwable) {}
                         }

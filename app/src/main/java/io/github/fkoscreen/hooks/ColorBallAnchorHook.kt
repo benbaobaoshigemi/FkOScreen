@@ -96,8 +96,151 @@ object ColorBallAnchorHook {
         }
     }
 
-    // 2. 在 system_server 中将色温球基准注入底层 CCT 插值与实时下发链路
+    @Volatile private var sCachedBallR: Int = 1000
+    @Volatile private var sCachedBallG: Int = 1000
+    @Volatile private var sCachedBallB: Int = 1000
+    @Volatile private var sContentResolver: ContentResolver? = null
+
+    private fun refreshBallRgbIfDefault() {
+        if (sCachedBallR == 1000 && sCachedBallG == 1000 && sCachedBallB == 1000) {
+            val resolver = sContentResolver ?: try {
+                val atClass = XposedHelpers.findClass("android.app.ActivityThread", null)
+                val app = XposedHelpers.callStaticMethod(atClass, "currentApplication") as? android.app.Application
+                app?.contentResolver?.also { sContentResolver = it }
+            } catch (_: Throwable) { null }
+            if (resolver != null) {
+                try {
+                    val str = Settings.System.getString(resolver, "eyeprotect_rgb")
+                    if (!str.isNullOrEmpty()) {
+                        val parts = str.split(",")
+                        if (parts.size >= 3) {
+                            sCachedBallR = parts[0].trim().toIntOrNull() ?: 1000
+                            sCachedBallG = parts[1].trim().toIntOrNull() ?: 1000
+                            sCachedBallB = parts[2].trim().toIntOrNull() ?: 1000
+                        }
+                    }
+                } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    // 2. 在 system_server 中将色温球基准注入底层 CCT 插值与实时下发链路（自适应 ColorOS 17 与 ColorOS 16）
     fun initSystemServer(classLoader: ClassLoader) {
+        var isColorOS17 = false
+
+        // ========================================================
+        // 分支 A: ColorOS 17 全新显示色彩管线 (DisplayColorController / OplusColorConfig)
+        // ========================================================
+        try {
+            val colorConfigClass = XposedHelpers.findClass(
+                "com.android.server.display.color.config.OplusColorConfig",
+                classLoader
+            )
+            isColorOS17 = true
+
+            // 核心 Hook 1 (ColorOS 17): 拦截 CCT 插值结果，注入色温球白点物理基准
+            XposedBridge.hookAllMethods(colorConfigClass, "interpolate", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    if (!ConfigManager.isColorBallAnchorEnabled()) return
+                    val pair = param.result as? Pair<*, *> ?: return
+                    val mainRGB = pair.first ?: return
+                    refreshBallRgbIfDefault()
+
+                    val ballR = sCachedBallR
+                    val ballG = sCachedBallG
+                    val ballB = sCachedBallB
+                    if (ballR == 1000 && ballG == 1000 && ballB == 1000) return
+
+                    val rGain = (ballR / 1000f).coerceIn(0.1f, 1.0f)
+                    val gGain = (ballG / 1000f).coerceIn(0.1f, 1.0f)
+                    val bGain = (ballB / 1000f).coerceIn(0.1f, 1.0f)
+
+                    val origR = XposedHelpers.getIntField(mainRGB, "red")
+                    val origG = XposedHelpers.getIntField(mainRGB, "green")
+                    val origB = XposedHelpers.getIntField(mainRGB, "blue")
+
+                    XposedHelpers.setIntField(mainRGB, "red", Math.round(origR * rGain).coerceIn(0, 1000))
+                    XposedHelpers.setIntField(mainRGB, "green", Math.round(origG * gGain).coerceIn(0, 1000))
+                    XposedHelpers.setIntField(mainRGB, "blue", Math.round(origB * bGain).coerceIn(0, 1000))
+
+                    val subRGB = pair.second
+                    if (subRGB != null) {
+                        val subOrigR = XposedHelpers.getIntField(subRGB, "red")
+                        val subOrigG = XposedHelpers.getIntField(subRGB, "green")
+                        val subOrigB = XposedHelpers.getIntField(subRGB, "blue")
+                        XposedHelpers.setIntField(subRGB, "red", Math.round(subOrigR * rGain).coerceIn(0, 1000))
+                        XposedHelpers.setIntField(subRGB, "green", Math.round(subOrigG * gGain).coerceIn(0, 1000))
+                        XposedHelpers.setIntField(subRGB, "blue", Math.round(subOrigB * bGain).coerceIn(0, 1000))
+                    }
+                }
+            })
+            XposedBridge.log("$TAG: Hooked OplusColorConfig.interpolate for ColorOS 17 anchor scaling")
+
+            // 核心 Hook 2 (ColorOS 17): 拦截 DisplayColorController，在拖拽色温球时解除 CCT 抑制并触发 0ms 刷新
+            val colorControllerClass = XposedHelpers.findClass(
+                "com.android.server.display.color.control.DisplayColorController",
+                classLoader
+            )
+            XposedBridge.hookAllConstructors(colorControllerClass, object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val cr = XposedHelpers.getObjectField(param.thisObject, "mContentResolver") as? ContentResolver
+                    if (cr != null) {
+                        sContentResolver = cr
+                    }
+                }
+            })
+            XposedBridge.hookAllMethods(colorControllerClass, "updateEyeProtectRGB", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val rgb = param.args.getOrNull(0)
+                    if (rgb != null) {
+                        sCachedBallR = XposedHelpers.getIntField(rgb, "red")
+                        sCachedBallG = XposedHelpers.getIntField(rgb, "green")
+                        sCachedBallB = XposedHelpers.getIntField(rgb, "blue")
+                    }
+                    if (!ConfigManager.isColorBallAnchorEnabled()) return
+                    try {
+                        val colorContext = XposedHelpers.getObjectField(param.thisObject, "mColorContext") ?: return
+                        val isEyeProtect = XposedHelpers.callMethod(colorContext, "isEyeProtectEnabled") as? Boolean ?: false
+                        val isCctReg = XposedHelpers.callMethod(colorContext, "isColorTemperatureRegulationEnabled") as? Boolean ?: false
+                        val isRhythm = XposedHelpers.callMethod(colorContext, "isComfortableRhythmEnabled") as? Boolean ?: false
+                        if (isEyeProtect || isCctReg || isRhythm) {
+                            val matrixConverter = XposedHelpers.getObjectField(param.thisObject, "mMatrixConverter")
+                            if (matrixConverter != null) {
+                                XposedHelpers.callMethod(matrixConverter, "apply")
+                            }
+                        }
+                    } catch (e: Throwable) {
+                        XposedBridge.log("$TAG: DisplayColorController.updateEyeProtectRGB error: ${e.message}")
+                    }
+                }
+            })
+            XposedBridge.log("$TAG: Hooked DisplayColorController for ColorOS 17 real-time color drag response")
+
+            // 核心 Hook 3 (ColorOS 17): 捕获 OplusFeatureRgbBall 生命周期，提取 ContentResolver 与初始白点
+            val featureRgbBallClass = XposedHelpers.findClass(
+                "com.android.server.display.color.feature.postprocess.OplusFeatureRgbBall",
+                classLoader
+            )
+            XposedBridge.hookAllMethods(featureRgbBallClass, "onSetUp", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val cr = XposedHelpers.getObjectField(param.thisObject, "mContentResolver") as? ContentResolver
+                    if (cr != null) {
+                        sContentResolver = cr
+                    }
+                    refreshBallRgbIfDefault()
+                }
+            })
+            XposedBridge.log("$TAG: Hooked OplusFeatureRgbBall.onSetUp for ColorOS 17")
+        } catch (_: Throwable) {}
+
+        if (isColorOS17) {
+            XposedBridge.log("$TAG: Initialized ColorOS 17 display color pipeline hooks successfully")
+            return
+        }
+
+        // ========================================================
+        // 分支 B: ColorOS 16 经典显示色彩管线 (OplusRgbBallManager / CCTCoefficientUtil)
+        // ========================================================
         val rgbBallClassName = "com.android.server.display.color.eyeprotect.manager.OplusRgbBallManager"
         val cctUtilClassName = "com.android.server.display.color.eyeprotect.util.CCTCoefficientUtil"
         val protectEyesUtilClassName = "com.android.server.display.color.eyeprotect.util.ProtectEyesUtil"
@@ -131,7 +274,7 @@ object ColorBallAnchorHook {
             null
         }
 
-        // 核心 Hook 1: 拦截所有护眼/自适应色彩场景下的 CCT 插值结果，注入色温球基准 (M_cct_anchored = M_cct * M_ball)
+        // 核心 Hook 1 (ColorOS 16): 拦截所有护眼/自适应色彩场景下的 CCT 插值结果，注入色温球基准 (M_cct_anchored = M_cct * M_ball)
         try {
             XposedBridge.hookAllMethods(cctUtilClass, "interpolate", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
@@ -176,7 +319,7 @@ object ColorBallAnchorHook {
             XposedBridge.log("$TAG: Failed to hook CCTCoefficientUtil.interpolate: ${t.message}")
         }
 
-        // 核心 Hook 2: 解除护眼/自适应模式下拖拽色温球的熔断阻断，实现 0ms 实时下发至硬件管线
+        // 核心 Hook 2 (ColorOS 16): 解除护眼/自适应模式下拖拽色温球的熔断阻断，实现 0ms 实时下发至硬件管线
         try {
             XposedBridge.hookAllMethods(rgbBallClass, "updateEyeProtectRGB", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
