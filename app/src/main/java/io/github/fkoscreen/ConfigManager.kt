@@ -17,6 +17,12 @@ object ConfigManager {
     const val KEY_HDR_RATIO = "hdr_ratio_fix"
     const val KEY_DARK_MODE_STYLES = "dark_mode_styles"
     const val KEY_COLOR_BALL_ANCHOR = "color_ball_anchor"
+    const val KEY_AOD_BRIGHTNESS_SCALE = "aod_brightness_scale"
+
+    // 原生全景 AOD 把尼特表 ÷1.6，即 0.625
+    const val DEFAULT_AOD_BRIGHTNESS_SCALE = 0.625f
+    const val MIN_AOD_BRIGHTNESS_SCALE = 0.5f
+    const val MAX_AOD_BRIGHTNESS_SCALE = 1.0f
 
     // 兼容旧版键名
     const val KEY_MANUAL_1250 = KEY_MANUAL_HBM
@@ -134,6 +140,41 @@ object ConfigManager {
             Thread {
                 try {
                     Runtime.getRuntime().exec(arrayOf("su", "-c", "settings put system $key $intValue")).waitFor()
+                } catch (_: Throwable) {}
+            }.start()
+        }
+    }
+
+    fun getAodBrightnessScale(): Float {
+        val value = try {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val app = atClass.getMethod("currentApplication").invoke(null) as? Context
+            app?.contentResolver?.let {
+                android.provider.Settings.System.getString(it, KEY_AOD_BRIGHTNESS_SCALE)?.toFloatOrNull()
+            }
+        } catch (_: Throwable) {
+            null
+        } ?: try {
+            getXPrefs().getFloat(KEY_AOD_BRIGHTNESS_SCALE, DEFAULT_AOD_BRIGHTNESS_SCALE)
+        } catch (_: Throwable) {
+            DEFAULT_AOD_BRIGHTNESS_SCALE
+        }
+        return value.coerceIn(MIN_AOD_BRIGHTNESS_SCALE, MAX_AOD_BRIGHTNESS_SCALE)
+    }
+
+    fun writeConfig(context: Context, key: String, value: Float) {
+        getAppPrefs(context).edit().putFloat(key, value).apply()
+        fixPermissions(context)
+        val text = value.toString()
+        val written = try {
+            android.provider.Settings.System.putString(context.contentResolver, key, text)
+        } catch (_: Throwable) {
+            false
+        }
+        if (!written) {
+            Thread {
+                try {
+                    Runtime.getRuntime().exec(arrayOf("su", "-c", "settings put system $key $text")).waitFor()
                 } catch (_: Throwable) {}
             }.start()
         }

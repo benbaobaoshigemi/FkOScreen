@@ -19,6 +19,7 @@ object SettingsProviderHook {
         "dark_mode_styles",
         "color_ball_anchor",
         "thermal_limit_bypass",
+        "aod_brightness_scale",
         "manual_1250_brightness",
         "manual_1600_brightness"
     )
