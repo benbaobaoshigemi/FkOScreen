@@ -157,11 +157,7 @@ fun MainScreen() {
     }
 
     fun updatePref(key: String, value: Boolean) {
-        prefs.edit().putBoolean(key, value).apply()
-        ConfigManager.fixPermissions(context)
-        try {
-            android.provider.Settings.System.putInt(context.contentResolver, key, if (value) 1 else 0)
-        } catch (_: Throwable) {}
+        ConfigManager.writeConfig(context, key, value)
     }
 
     LaunchedEffect(Unit) {
@@ -198,12 +194,14 @@ fun MainScreen() {
         if (needCommit) {
             editor.apply()
         }
-        ConfigManager.fixPermissions(context)
-        try {
-            android.provider.Settings.System.putInt(context.contentResolver, ConfigManager.KEY_MANUAL_HBM, if (manualHbm) 1 else 0)
-            android.provider.Settings.System.putInt(context.contentResolver, ConfigManager.KEY_MANUAL_PEAK, if (manualPeak) 1 else 0)
-            android.provider.Settings.System.putInt(context.contentResolver, ConfigManager.KEY_THERMAL_BYPASS, if (thermalBypass) 1 else 0)
-        } catch (_: Throwable) {}
+        // 每次打开界面都把全部开关同步到 Settings.System，hook 侧只认这一处
+        updatePref(ConfigManager.KEY_MANUAL_HBM, manualHbm)
+        updatePref(ConfigManager.KEY_MANUAL_PEAK, manualPeak)
+        updatePref(ConfigManager.KEY_THERMAL_BYPASS, thermalBypass)
+        updatePref(ConfigManager.KEY_FOSS_BYPASS, fossBypass)
+        updatePref(ConfigManager.KEY_HDR_RATIO, hdrRatio)
+        updatePref(ConfigManager.KEY_DARK_MODE_STYLES, darkModeStyles)
+        updatePref(ConfigManager.KEY_COLOR_BALL_ANCHOR, colorBallAnchor)
     }
 
     Scaffold(

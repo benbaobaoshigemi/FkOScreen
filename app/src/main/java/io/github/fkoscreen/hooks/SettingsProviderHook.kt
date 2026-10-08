@@ -14,6 +14,10 @@ object SettingsProviderHook {
         "color_temperate_ball_mode",
         "manual_hbm_brightness",
         "manual_peak_brightness",
+        "foss_bypass",
+        "hdr_ratio_fix",
+        "dark_mode_styles",
+        "color_ball_anchor",
         "thermal_limit_bypass",
         "manual_1250_brightness",
         "manual_1600_brightness"

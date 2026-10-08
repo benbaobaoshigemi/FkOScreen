@@ -207,6 +207,21 @@ object BrightnessLimitHook {
                     }
                 }
             })
+            // 自动亮度与亮度条拖动：温控档位下会丢弃向上的拖动点并钳住自动亮度目标
+            XposedBridge.hookAllMethods(tempLimitClass, "isDragUpBlockedByTemperatureLimit", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (ConfigManager.isThermalBypassEnabled()) {
+                        param.result = false
+                    }
+                }
+            })
+            XposedBridge.hookAllMethods(tempLimitClass, "getTemperatureLimitBrightness", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (ConfigManager.isThermalBypassEnabled()) {
+                        param.result = Float.NaN
+                    }
+                }
+            })
             XposedBridge.log("$TAG: Hooked OplusFeatureTemperatureLimitBrightness (Thermal Bypass)")
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: Failed to hook OplusFeatureTemperatureLimitBrightness: ${t.message}")
@@ -235,25 +250,26 @@ object BrightnessLimitHook {
             XposedBridge.log("$TAG: Failed to hook DisplayPowerController: ${t.message}")
         }
 
-        // 8. 拦截 DisplayManagerService.getBrightnessInfo，修改返回给外部的 brightnessMaximum
+        // 8. EDR（HDR 高光）自带的温度分档限制，与 SDR 温控相互独立
         try {
-            val dmsClass = XposedHelpers.findClass(
-                "com.android.server.display.DisplayManagerService",
+            val edrTempLimiterClass = XposedHelpers.findClass(
+                "com.android.server.display.feature.postprocess.edr.limiter.TemperatureLimiter",
                 classLoader
             )
-            XposedBridge.hookAllMethods(dmsClass, "getBrightnessInfo", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val info = param.result ?: return
-                    val target = getTargetBrightness() ?: return
-                    try {
-                        XposedHelpers.setFloatField(info, "brightnessMaximum", target)
-                    } catch (_: Throwable) {}
+            XposedBridge.hookAllMethods(edrTempLimiterClass, "setTemperature", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    // <=0 会被归一为默认温度 32℃，即最低温档、不限制
+                    if (ConfigManager.isThermalBypassEnabled()) {
+                        param.args[0] = 0
+                    }
                 }
             })
-            XposedBridge.log("$TAG: Hooked DisplayManagerService.getBrightnessInfo")
+            XposedBridge.log("$TAG: Hooked EDR TemperatureLimiter (Thermal Bypass)")
         } catch (t: Throwable) {
-            XposedBridge.log("$TAG: Failed to hook DisplayManagerService.getBrightnessInfo: ${t.message}")
+            XposedBridge.log("$TAG: Failed to hook EDR TemperatureLimiter: ${t.message}")
         }
+        // 注：SystemUI 亮度条上限经 PowerManager.getMaximumScreenBrightnessSetting
+        // → OplusDisplayBrightnessModel.getMaxBrightness 获取，已由第 4 步覆盖
     }
 
     fun initSystemUI(classLoader: ClassLoader) {
