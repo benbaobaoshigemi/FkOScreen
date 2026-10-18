@@ -1,7 +1,11 @@
 package io.github.fkoscreen.hooks
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
+import android.os.Handler
 import android.provider.Settings
 import android.util.SparseArray
 import de.robv.android.xposed.XC_MethodHook
@@ -52,6 +56,7 @@ object RefreshRate144Hook {
         hookOplusRefreshRateConfigs(classLoader)
         hookPreferredRefreshRateData(classLoader)
         hookOplusRefreshRatePolicyImpl(classLoader)
+        hookUnlockRefresh(classLoader)
         hookPickRefreshRateData(classLoader)
         hookRefreshRateCore(classLoader)
         hookDCController(classLoader)
@@ -181,6 +186,19 @@ object RefreshRate144Hook {
             raise120To144("getKeyguardRefreshRateId")
             raise120To144("getMaxRateIdInLimit144")
 
+            // 支持锁屏单独配置刷新率的机型（mSupportLockScreenConfigRate），锁屏/AOD 时不走
+            // getKeyguardRefreshRateId，而是查 systemui 的 NotificationShade 配置，表里写的是 120
+            XposedBridge.hookAllMethods(cls, "getPkgRefreshRateId", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    if (sExtremeMode && (param.result as? Int) == RATE_ID_120 &&
+                        param.args.getOrNull(0) == "com.android.systemui" &&
+                        param.args.getOrNull(1) == "NotificationShade"
+                    ) {
+                        param.result = RATE_ID_144
+                    }
+                }
+            })
+
             // 温控：不写入 PRIORITY_HIGH_TEMPERATURE 投票，也不通知 ADFR 进入高温策略
             XposedBridge.hookAllMethods(cls, "setHighTemperatureStatusWithoutUpdate", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
@@ -193,6 +211,57 @@ object RefreshRate144Hook {
             XposedBridge.log("$TAG: Hooked OplusRefreshRatePolicyImpl OK")
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: OplusRefreshRatePolicyImpl failed: ${t.message}")
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // D2. 解锁后重新拉满  （system_server）
+    //    SF 的 OTI（触控空闲）投票 oti-hw 只在显示模式切换时重读当前上限。息屏时上限被压到
+    //    120（AOD 动画）或 60（Doze），解锁后上限回到 144，但若当前模式恰好等于 OTI 的投票，
+    //    就没有模式切换，OTI 一直停在旧上限。原生上限本就是 120，看不出来。打开应用时的
+    //    startAppSwitchBoost 会把 min=max 设为 144 两秒，触发模式切换，这里在解锁后补一次。
+    // ─────────────────────────────────────────────────────────────────────────
+    private const val UNLOCK_BOOST_DELAY_MS = 1200L
+
+    private fun hookUnlockRefresh(classLoader: ClassLoader) {
+        try {
+            val cls = XposedHelpers.findClass(
+                "com.android.server.wm.OplusRefreshRatePolicyImpl", classLoader
+            )
+            XposedBridge.hookAllMethods(cls, "onSystemReady", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val policy = param.thisObject
+                    val context = XposedHelpers.getObjectField(policy, "mContext") as Context
+                    val handler = XposedHelpers.getObjectField(policy, "mHandler") as Handler
+                    context.registerReceiver(object : BroadcastReceiver() {
+                        override fun onReceive(c: Context, intent: Intent) {
+                            if (!sExtremeMode) return
+                            // 解锁动画期间 startAppSwitchBoost 会直接放弃，等动画结束
+                            handler.postDelayed({ boostAfterUnlock(policy) }, UNLOCK_BOOST_DELAY_MS)
+                        }
+                    }, IntentFilter(Intent.ACTION_USER_PRESENT), null, handler)
+                    XposedBridge.log("$TAG: unlock refresh receiver registered")
+                }
+            })
+            XposedBridge.log("$TAG: Hooked unlock refresh OK")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: unlock refresh failed: ${t.message}")
+        }
+    }
+
+    private fun boostAfterUnlock(policy: Any) {
+        if (!sExtremeMode) return
+        try {
+            val display = XposedHelpers.getObjectField(policy, "mDisplayContent")
+            val wms = XposedHelpers.getObjectField(policy, "mWmService")
+            val lock = XposedHelpers.getObjectField(wms, "mGlobalLock")
+            synchronized(lock) {
+                val top = XposedHelpers.callMethod(display, "topRunningActivity") ?: return
+                XposedHelpers.callMethod(policy, "startAppSwitchBoost", top)
+            }
+            XposedBridge.log("$TAG: refresh boost after unlock")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: refresh boost after unlock failed: ${t.message}")
         }
     }
 
