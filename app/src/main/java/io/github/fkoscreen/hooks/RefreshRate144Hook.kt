@@ -273,6 +273,24 @@ object RefreshRate144Hook {
             val cls = XposedHelpers.findClass(
                 "com.android.server.wm.OplusRefreshRatePolicyImpl\$PickRefreshRateData", classLoader
             )
+            // 锁屏/AOD 分支：getKeyguardRefreshRateId、getPkgRefreshRateId(systemui, NotificationShade)
+            // 体积小，会被 ART 内联进本方法，单独 hook 它们不一定生效。这里按该分支刚写入的
+            // 调试串 ";keyguardShown:<id>" 识别，只改锁屏分支的结果
+            XposedBridge.hookAllMethods(cls, "getNormalModePickPreferredId", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    if (!sExtremeMode || (param.result as? Int) != RATE_ID_120) return
+                    try {
+                        val outer = XposedHelpers.getObjectField(param.thisObject, "this\$0")
+                        val debug = XposedHelpers.getObjectField(outer, "mDebugInfo") as? StringBuilder ?: return
+                        if (debug.endsWith(";keyguardShown:$RATE_ID_120")) {
+                            debug.setLength(debug.length - 1)
+                            debug.append(RATE_ID_144)
+                            XposedHelpers.setIntField(param.thisObject, "mLastPickPreferredId", RATE_ID_144)
+                            param.result = RATE_ID_144
+                        }
+                    } catch (_: Throwable) {}
+                }
+            })
             // 输入法 / 录音中的应用 / 相机占用中的应用 → 60Hz；录音包名列表在停止事件丢失时会残留
             XposedBridge.hookAllMethods(cls, "getSpecialLowRefreshRateId", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
