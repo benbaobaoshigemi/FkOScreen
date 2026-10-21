@@ -221,7 +221,9 @@ object RefreshRate144Hook {
     //    就没有模式切换，OTI 一直停在旧上限。原生上限本就是 120，看不出来。打开应用时的
     //    startAppSwitchBoost 会把 min=max 设为 144 两秒，触发模式切换，这里在解锁后补一次。
     // ─────────────────────────────────────────────────────────────────────────
-    private const val UNLOCK_BOOST_DELAY_MS = 1200L
+    // 解锁动画期间 startAppSwitchBoost 会直接放弃，动画时长又随解锁方式变化，固定延迟要么
+    // 被放弃、要么让人先看到一段 60Hz。亮屏和解锁时从 0ms 起连续补发，被放弃的几次无副作用
+    private val UNLOCK_BOOST_DELAYS_MS = longArrayOf(0L, 150L, 350L, 600L, 900L, 1300L)
 
     private fun hookUnlockRefresh(classLoader: ClassLoader) {
         try {
@@ -236,10 +238,14 @@ object RefreshRate144Hook {
                     context.registerReceiver(object : BroadcastReceiver() {
                         override fun onReceive(c: Context, intent: Intent) {
                             if (!sExtremeMode) return
-                            // 解锁动画期间 startAppSwitchBoost 会直接放弃，等动画结束
-                            handler.postDelayed({ boostAfterUnlock(policy) }, UNLOCK_BOOST_DELAY_MS)
+                            for (delay in UNLOCK_BOOST_DELAYS_MS) {
+                                handler.postDelayed({ boostAfterUnlock(policy) }, delay)
+                            }
                         }
-                    }, IntentFilter(Intent.ACTION_USER_PRESENT), null, handler)
+                    }, IntentFilter().apply {
+                        addAction(Intent.ACTION_SCREEN_ON)
+                        addAction(Intent.ACTION_USER_PRESENT)
+                    }, null, handler)
                     XposedBridge.log("$TAG: unlock refresh receiver registered")
                 }
             })
@@ -259,7 +265,6 @@ object RefreshRate144Hook {
                 val top = XposedHelpers.callMethod(display, "topRunningActivity") ?: return
                 XposedHelpers.callMethod(policy, "startAppSwitchBoost", top)
             }
-            XposedBridge.log("$TAG: refresh boost after unlock")
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: refresh boost after unlock failed: ${t.message}")
         }
